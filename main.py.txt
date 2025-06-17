@@ -1,0 +1,202 @@
+import os
+import time
+import math
+import requests
+from binance.client import Client
+from binance.enums import *
+from datetime import datetime
+import numpy as np
+
+# Load API keys
+api_key = os.getenv('BINANCE_API_KEY')
+api_secret = os.getenv('BINANCE_API_SECRET')
+client = Client(api_key, api_secret)
+
+symbol_list = ['BTCUSDT', 'ETHUSDT']
+leverage = 20
+risk_per_trade = 1.5  # Risk $1.5 per trade
+max_daily_loss = 4.5  # Stop trading after $4.5 loss
+max_trades_per_day = 5
+rr_ratio = 2  # 1:2 risk reward
+rsi_period = 14
+rsi_overbought = 70
+rsi_oversold = 30
+cooldown_minutes = 5
+
+daily_trades = 0
+daily_loss = 0
+consecutive_losses = 0
+
+# Set leverage for each symbol
+for symbol in symbol_list:
+    try:
+        client.futures_change_leverage(symbol=symbol, leverage=leverage)
+    except:
+        pass
+
+def get_price(symbol):
+    try:
+        return float(client.futures_symbol_ticker(symbol=symbol)['price'])
+    except:
+        return None
+
+def get_balance():
+    for asset in client.futures_account_balance():
+        if asset['asset'] == 'USDT':
+            return float(asset['balance'])
+    return 0
+
+def get_klines(symbol, interval='1m', limit=100):
+    return client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+
+def calculate_rsi(closes, period=14):
+    deltas = np.diff(closes)
+    ups = np.where(deltas > 0, deltas, 0)
+    downs = np.where(deltas < 0, -deltas, 0)
+    avg_gain = np.mean(ups[-period:])
+    avg_loss = np.mean(downs[-period:])
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def get_signal(symbol):
+    klines = get_klines(symbol)
+    closes = [float(k[4]) for k in klines]
+    rsi = calculate_rsi(np.array(closes), rsi_period)
+    last_close = closes[-1]
+    prev_close = closes[-2]
+
+    if rsi < rsi_oversold and last_close > prev_close:
+        return 'buy'
+    elif rsi > rsi_overbought and last_close < prev_close:
+        return 'sell'
+    return 'hold'
+
+def calculate_qty(symbol, entry_price):
+    qty = (risk_per_trade * leverage) / entry_price
+    if symbol == 'BTCUSDT':
+        return round(qty, 5)
+    return round(qty, 3)
+
+def get_unrealized_pnl(symbol):
+    try:
+        positions = client.futures_account()['positions']
+        for p in positions:
+            if p['symbol'] == symbol:
+                return float(p['unRealizedProfit'])
+    except:
+        pass
+    return 0
+
+def close_open_position(symbol, side):
+    try:
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL if side == 'buy' else SIDE_BUY,
+            type=ORDER_TYPE_MARKET,
+            quantity=abs(float(get_position_amount(symbol)))
+        )
+    except:
+        pass
+
+def get_position_amount(symbol):
+    try:
+        for p in client.futures_account()['positions']:
+            if p['symbol'] == symbol:
+                return float(p['positionAmt'])
+    except:
+        pass
+    return 0
+
+def place_bracket_order(symbol, side, qty, entry_price):
+    global consecutive_losses, daily_trades, daily_loss
+
+    sl_price = round(entry_price * (0.99 if side == 'buy' else 1.01), 2)
+    tp_price = round(entry_price * (1.02 if side == 'buy' else 0.98), 2)
+
+    try:
+        # Entry
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_BUY if side == 'buy' else SIDE_SELL,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+        print(f"[✅] {side.upper()} ENTRY placed for {symbol} at {entry_price}")
+
+        # TP and SL
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL if side == 'buy' else SIDE_BUY,
+            type=ORDER_TYPE_STOP_MARKET,
+            stopPrice=sl_price,
+            closePosition=True
+        )
+
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL if side == 'buy' else SIDE_BUY,
+            type=ORDER_TYPE_LIMIT,
+            price=tp_price,
+            timeInForce='GTC',
+            closePosition=True
+        )
+
+        # Wait for position to close (polling every 10s)
+        print("[📊] Waiting for position to close...")
+        while True:
+            amt = float(get_position_amount(symbol))
+            if abs(amt) < 0.0001:
+                break
+            time.sleep(10)
+
+        pnl = get_unrealized_pnl(symbol)
+        daily_loss += -pnl if pnl < 0 else 0
+        if pnl < 0:
+            consecutive_losses += 1
+            print(f"[❌] LOSS: {pnl:.2f} USDT")
+        else:
+            consecutive_losses = 0
+            print(f"[🏆] PROFIT: {pnl:.2f} USDT")
+
+        daily_trades += 1
+
+    except Exception as e:
+        print(f"[❌] Error placing trade for {symbol}: {e}")
+
+def run_bot():
+    global daily_trades, daily_loss, consecutive_losses
+
+    while True:
+        if daily_trades >= max_trades_per_day:
+            print("[⛔] Max trades reached. Stopping.")
+            break
+        if daily_loss >= max_daily_loss:
+            print("[⛔] Max daily loss reached. Stopping.")
+            break
+        if consecutive_losses >= 3:
+            print("[⛔] 3 consecutive losses. Stopping.")
+            break
+
+        balance = get_balance()
+        print(f"[💰] Balance: {balance:.2f} USDT")
+
+        for symbol in symbol_list:
+            signal = get_signal(symbol)
+            price = get_price(symbol)
+            print(f"[📈] {symbol} signal: {signal}")
+
+            if signal != 'hold' and price:
+                qty = calculate_qty(symbol, price)
+                if qty * price < 5:
+                    print(f"[⚠️] Notional too low for {symbol}, skipping.")
+                    continue
+
+                place_bracket_order(symbol, signal, qty, price)
+
+        print(f"[⏳] Waiting {cooldown_minutes} minutes...")
+        time.sleep(cooldown_minutes * 60)
+
+if __name__ == '__main__':
+    run_bot()

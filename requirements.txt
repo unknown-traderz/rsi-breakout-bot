@@ -1,0 +1,9 @@
+python-binance>=1.0.16
+pandas
+requests
+cryptography
+ta
+flask
+numpy
+binance
+python-dotenv
