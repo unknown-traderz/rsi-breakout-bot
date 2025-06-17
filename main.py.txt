@@ -1,33 +1,34 @@
 import os
 import time
 import math
-import requests
+import numpy as np
 from binance.client import Client
 from binance.enums import *
-from datetime import datetime
-import numpy as np
+from dotenv import load_dotenv
 
 # Load API keys
+load_dotenv()
 api_key = os.getenv('BINANCE_API_KEY')
 api_secret = os.getenv('BINANCE_API_SECRET')
 client = Client(api_key, api_secret)
 
+# Config
 symbol_list = ['BTCUSDT', 'ETHUSDT']
 leverage = 20
-risk_per_trade = 1.5  # Risk $1.5 per trade
-max_daily_loss = 4.5  # Stop trading after $4.5 loss
+risk_per_trade = 1.5
+max_daily_loss = 4.5
 max_trades_per_day = 5
-rr_ratio = 2  # 1:2 risk reward
-rsi_period = 14
-rsi_overbought = 70
-rsi_oversold = 30
 cooldown_minutes = 5
+rsi_period = 14
+rsi_oversold = 30
+rsi_overbought = 70
 
+# State
 daily_trades = 0
 daily_loss = 0
 consecutive_losses = 0
 
-# Set leverage for each symbol
+# Set leverage
 for symbol in symbol_list:
     try:
         client.futures_change_leverage(symbol=symbol, leverage=leverage)
@@ -41,10 +42,12 @@ def get_price(symbol):
         return None
 
 def get_balance():
-    for asset in client.futures_account_balance():
-        if asset['asset'] == 'USDT':
-            return float(asset['balance'])
-    return 0
+    try:
+        for asset in client.futures_account_balance():
+            if asset['asset'] == 'USDT':
+                return float(asset['balance'])
+    except:
+        return 0
 
 def get_klines(symbol, interval='1m', limit=100):
     return client.futures_klines(symbol=symbol, interval=interval, limit=limit)
@@ -74,66 +77,55 @@ def get_signal(symbol):
     return 'hold'
 
 def calculate_qty(symbol, entry_price):
-    qty = (risk_per_trade * leverage) / entry_price
-    if symbol == 'BTCUSDT':
-        return round(qty, 5)
-    return round(qty, 3)
-
-def get_unrealized_pnl(symbol):
     try:
-        positions = client.futures_account()['positions']
-        for p in positions:
-            if p['symbol'] == symbol:
-                return float(p['unRealizedProfit'])
-    except:
-        pass
-    return 0
+        exchange_info = client.futures_exchange_info()
+        for s in exchange_info['symbols']:
+            if s['symbol'] == symbol:
+                step_size = float([f for f in s['filters'] if f['filterType'] == 'LOT_SIZE'][0]['stepSize'])
+                precision = int(round(-math.log(step_size, 10)))
+                break
+        else:
+            print(f"[⚠️] Couldn't find precision for {symbol}")
+            return 0
 
-def close_open_position(symbol, side):
-    try:
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL if side == 'buy' else SIDE_BUY,
-            type=ORDER_TYPE_MARKET,
-            quantity=abs(float(get_position_amount(symbol)))
-        )
-    except:
-        pass
+        qty = (risk_per_trade * leverage) / entry_price
+        qty = round(qty, precision)
 
-def get_position_amount(symbol):
-    try:
-        for p in client.futures_account()['positions']:
-            if p['symbol'] == symbol:
-                return float(p['positionAmt'])
-    except:
-        pass
-    return 0
+        if qty * entry_price < 5:
+            print(f"[⚠️] Notional too low for {symbol}. Qty: {qty}, Value: {qty * entry_price:.2f}")
+            return 0
+
+        return qty
+    except Exception as e:
+        print(f"[❌] Error calculating quantity: {e}")
+        return 0
 
 def place_bracket_order(symbol, side, qty, entry_price):
-    global consecutive_losses, daily_trades, daily_loss
+    global daily_trades, daily_loss, consecutive_losses
 
     sl_price = round(entry_price * (0.99 if side == 'buy' else 1.01), 2)
     tp_price = round(entry_price * (1.02 if side == 'buy' else 0.98), 2)
 
     try:
         # Entry
-        order = client.futures_create_order(
+        client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY if side == 'buy' else SIDE_SELL,
             type=ORDER_TYPE_MARKET,
             quantity=qty
         )
-        print(f"[✅] {side.upper()} ENTRY placed for {symbol} at {entry_price}")
 
-        # TP and SL
+        # Stop Loss
         client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL if side == 'buy' else SIDE_BUY,
             type=ORDER_TYPE_STOP_MARKET,
             stopPrice=sl_price,
+            timeInForce='GTC',
             closePosition=True
         )
 
+        # Take Profit
         client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL if side == 'buy' else SIDE_BUY,
@@ -143,25 +135,8 @@ def place_bracket_order(symbol, side, qty, entry_price):
             closePosition=True
         )
 
-        # Wait for position to close (polling every 10s)
-        print("[📊] Waiting for position to close...")
-        while True:
-            amt = float(get_position_amount(symbol))
-            if abs(amt) < 0.0001:
-                break
-            time.sleep(10)
-
-        pnl = get_unrealized_pnl(symbol)
-        daily_loss += -pnl if pnl < 0 else 0
-        if pnl < 0:
-            consecutive_losses += 1
-            print(f"[❌] LOSS: {pnl:.2f} USDT")
-        else:
-            consecutive_losses = 0
-            print(f"[🏆] PROFIT: {pnl:.2f} USDT")
-
+        print(f"[✅] {side.upper()} order placed on {symbol} | Qty: {qty} | SL: {sl_price} | TP: {tp_price}")
         daily_trades += 1
-
     except Exception as e:
         print(f"[❌] Error placing trade for {symbol}: {e}")
 
@@ -189,13 +164,11 @@ def run_bot():
 
             if signal != 'hold' and price:
                 qty = calculate_qty(symbol, price)
-                if qty * price < 5:
-                    print(f"[⚠️] Notional too low for {symbol}, skipping.")
+                if qty == 0:
                     continue
-
                 place_bracket_order(symbol, signal, qty, price)
 
-        print(f"[⏳] Waiting {cooldown_minutes} minutes...")
+        print(f"[⏳] Waiting {cooldown_minutes} minutes...\n")
         time.sleep(cooldown_minutes * 60)
 
 if __name__ == '__main__':
