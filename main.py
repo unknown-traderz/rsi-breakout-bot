@@ -5,6 +5,7 @@ import numpy as np
 from binance.client import Client
 from binance.enums import *
 from dotenv import load_dotenv
+from keep_alive import keep_alive  # ✅ Import keep_alive
 
 # Load API keys
 load_dotenv()
@@ -171,5 +172,7 @@ def run_bot():
         print(f"[⏳] Waiting {cooldown_minutes} minutes...\n")
         time.sleep(cooldown_minutes * 60)
 
+# ✅ Keep Alive + Run Bot
 if __name__ == '__main__':
-    run_bot()
+    keep_alive()   # Start Flask server
+    run_bot()      # Start bot loop
